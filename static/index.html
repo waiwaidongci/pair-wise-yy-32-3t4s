@@ -1,1 +1,250 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>批次放行</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>药品生产偏差与批次放行</h1><p>偏差、检验、返工、供应商变更和稳定性数据共同约束质量放行。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>批次血缘与放行</title>
+<style>
+body{font:15px system-ui,sans-serif;max-width:1180px;margin:24px auto;padding:0 18px;color:#1f2933}
+h1{margin-bottom:4px} h2{margin-top:28px;border-bottom:2px solid #d9e2ec;padding-bottom:6px}
+h3{margin:14px 0 8px} .muted{color:#616e7c;font-size:13px}
+.bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:12px 0}
+input,select,textarea,button{font:inherit;padding:6px 9px;border:1px solid #bcccdc;border-radius:6px}
+button{cursor:pointer;background:#102a43;color:#fff;border-color:#102a43}
+button.ghost{background:#fff;color:#102a43} button.danger{background:#9b2c2c;border-color:#9b2c2c}
+.card{border:1px solid #d9e2ec;border-radius:8px;padding:12px 14px;margin:10px 0;background:#fff}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.tag{display:inline-block;padding:2px 9px;border-radius:11px;font-size:12px;font-weight:600;color:#fff;background:#627d98}
+.tag.manufactured{background:#486581}.tag.investigation{background:#b7791f}.tag.awaiting_resample{background:#b7791f}
+.tag.conditional{background:#829ab1}.tag.released{background:#2f855a}.tag.rejected{background:#9b2c2c}
+.tag.recall_pending{background:#c53030}.tag.crit{background:#c53030}
+.edge{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:6px 0;border-bottom:1px dashed #e4e7eb}
+.arrow{color:#829ab1;font-weight:700}.qty{font-weight:700;color:#102a43}
+.block{background:#fff5f5;border:1px solid #feb2b2;color:#742a2a;border-radius:6px;padding:8px 10px;margin:6px 0}
+.ok{color:#2f855a}.recall{background:#fffaf0;border:1px solid #fbd38d;border-radius:6px;padding:6px 10px;margin:4px 0;font-size:13px}
+table{border-collapse:collapse;width:100%;font-size:13px;margin:6px 0}td,th{border:1px solid #e4e7eb;padding:4px 8px;text-align:left}
+.detail{margin-top:10px;border-top:1px solid #d9e2ec;padding-top:10px}
+#toast{position:fixed;top:14px;right:14px;max-width:420px;z-index:9}
+.toast-err{background:#9b2c2c}.toast-ok{background:#2f855a}
+.toast-item{color:#fff;padding:10px 14px;border-radius:6px;margin-bottom:8px;box-shadow:0 2px 8px rgba(0,0,0,.2)}
+form.inline{display:inline}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:8px 14px}
+.grid label{display:flex;flex-direction:column;gap:3px;font-size:12px;color:#486581}
+pre{background:#f0f4f8;padding:8px;border-radius:6px;overflow:auto;font-size:12px}
+</style>
+<h1>药品批次血缘、召回与放行</h1>
+<p class="muted">登记分装/返工的上下游批次与投入量；上游拒收或出现未关闭关键偏差时，全部下游批次进入召回待审，已放行批撤回但保留原决定。跨厂关系、超量投入和成环均不落库。</p>
+
+<div class="bar">
+  <label>身份 <input id="actor" value="operator-demo" style="width:130px"></label>
+  <label>角色 <select id="role"><option>operator</option><option>inspector</option><option>lab</option><option>qa</option></select></label>
+  <button onclick="loadState()">刷新状态</button>
+  <span id="health" class="muted"></span>
+</div>
+<div id="toast"></div>
+
+<div class="card">
+  <h3 style="margin-top:0">登记工厂 / 批次 / 血缘关系</h3>
+  <div class="grid">
+    <label>工厂代号<input id="f_code" placeholder="F-NEW"></label>
+    <label>工厂名称<input id="f_name" placeholder="新工厂"></label>
+    <label>国家<input id="f_country" value="CN"></label>
+  </div>
+  <p><button onclick="addFactory()">登记工厂（qa）</button></p>
+  <div class="grid">
+    <label>工厂<select id="b_factory"></select></label>
+    <label>批号<input id="b_no"></label>
+    <label>产品<input id="b_product" placeholder="阿莫西林片"></label>
+    <label>生产日期<input id="b_mfg" type="date"></label>
+    <label>有效期至<input id="b_exp" type="date"></label>
+    <label>批量（可投入量）<input id="b_qty" type="number" value="0" min="0"></label>
+  </div>
+  <p><button onclick="addBatch()">登记批次（operator）</button></p>
+  <div class="grid">
+    <label>工厂<select id="l_factory"></select></label>
+    <label>上游（来源批）<select id="l_up"></select></label>
+    <label>下游（包装/返工批）<select id="l_down"></select></label>
+    <label>本次投入量<input id="l_qty" type="number" min="0" step="any"></label>
+    <label>上游当前修订号<input id="l_rev" type="number"></label>
+  </div>
+  <p><button onclick="addLineage()">登记上下游血缘（operator/qa）</button></p>
+</div>
+
+<h2>血缘链路总览</h2>
+<div id="chains" class="muted">加载中...</div>
+
+<h2>批次（点击展开上下游、阻塞与质量流程）</h2>
+<div id="batches">加载中...</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const h = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const STATE_NAME = {manufactured:'已生产',investigation:'调查中',awaiting_resample:'待再取样',conditional:'有条件放行',released:'已放行',rejected:'已拒收',recall_pending:'召回待审'};
+let STATE = null;
+
+async function api(path, body, method='POST'){
+  const opt = {method, headers:{'Content-Type':'application/json','X-Actor':$('actor').value,'X-Role':$('role').value}};
+  if(body) opt.body = JSON.stringify(body);
+  const r = await fetch(path, opt), d = await r.json();
+  if(!r.ok) throw new Error(d.error || ('HTTP '+r.status));
+  return d;
+}
+function toast(msg, ok){ const d=document.createElement('div'); d.className='toast-item '+(ok?'toast-ok':'toast-err'); d.textContent=msg; $('toast').append(d); setTimeout(()=>d.remove(), 6000); }
+async function run(fn){ try{ await fn(); await loadState(); } catch(e){ toast(e.message); } }
+
+async function loadState(){
+  STATE = await api('/api/state', null, 'GET');
+  const fsel = v => STATE.factories.map(f=>`<option value="${f.id}"${f.code==='F-DEMO'?' selected':''}>${h(f.code)} ${h(f.name)}</option>`).join('');
+  $('b_factory').innerHTML = fsel(); $('l_factory').innerHTML = fsel();
+  renderChains(); renderBatches();
+  (async()=>{ const he = await api('/api/health',null,'GET'); $('health').textContent = '服务正常 '+he.status; })();
+}
+function batchById(id){ return STATE.batches.find(b=>b.id===id); }
+function factoryName(id){ const f = STATE.factories.find(x=>x.id===id); return f?f.code:'?'; }
+
+function renderChains(){
+  if(!STATE.lineage.length){ $('chains').innerHTML = '<span class="muted">暂无血缘关系</span>'; return; }
+  $('chains').innerHTML = STATE.lineage.map(e=>{
+    const u=batchById(e.upstream_id), d=batchById(e.downstream_id);
+    return `<div class="edge">
+      <span class="tag ${u.state}">${h(u.batch_no)}</span><span class="muted">${STATE_NAME[u.state]}</span>
+      <span class="arrow">── ${h(factoryName(u.factory_id))} 投入 <span class="qty">${h(e.quantity)}</span> ──▶</span>
+      <span class="tag ${d.state}">${h(d.batch_no)}</span><span class="muted">${STATE_NAME[d.state]}</span>
+      <span class="muted">（来源批剩余可用 ${h(e.upstream_available_remaining)}）</span></div>`;
+  }).join('');
+}
+
+function renderBatches(){
+  $('batches').innerHTML = STATE.batches.map(b=>{
+    const blockers = STATE.active_blockers[b.id] || [];
+    return `<div class="card" id="card-${b.id}">
+      <div class="row">
+        <button class="ghost" onclick="toggle(${b.id})">展开</button>
+        <strong>${h(b.batch_no)}</strong> <span class="muted">[${h(factoryName(b.factory_id))}]</span>
+        <span class="tag ${b.state}">${STATE_NAME[b.state]}</span>
+        <span class="muted">${h(b.product)} | 批量 ${h(b.quantity)} / 可用 ${h(b.available_quantity)} | rev ${b.revision}</span>
+        ${blockers.length?`<span class="tag crit">阻塞 ×${blockers.length}</span>`:''}
+      </div><div id="detail-${b.id}"></div></div>`;
+  }).join('');
+}
+
+async function toggle(id){
+  const box = $('detail-'+id);
+  if(box.innerHTML){ box.innerHTML=''; return; }
+  box.innerHTML = '<p class="muted">加载中...</p>';
+  const d = await api('/api/batches/'+id, null, 'GET');
+  box.innerHTML = renderDetail(d);
+}
+
+function edgeLine(e, dir){
+  const otherId = dir==='up'?e.upstream_id:e.downstream_id;
+  const other = batchById(otherId);
+  const selfSide = dir==='up' ? `<span class="arrow">◀── 投入 <span class="qty">${h(e.quantity)}</span> ──</span><span class="tag ${other.state}">${h(e.upstream_batch_no)}</span>`
+                              : `<span class="tag ${other.state}">${h(e.downstream_batch_no)}</span><span class="arrow">── 投入 <span class="qty">${h(e.quantity)}</span> ──▶</span>`;
+  const avail = dir==='up' ? `<span class="muted">来源批剩余 ${h(e.upstream_available_remaining)}</span>` : '';
+  return `<div class="edge">${selfSide} <span class="muted">${other?STATE_NAME[other.state]:''}</span> ${avail}</div>`;
+}
+
+function renderDetail(d){
+  const b = d.batch;
+  const blockers = d.active_blockers.length
+    ? d.active_blockers.map(x=>`<div class="block">⛔ ${h(x.message)}</div>`).join('')
+    : '<div class="ok">✓ 无活动阻塞来源</div>';
+  const upstream = d.upstream_lineage.length ? d.upstream_lineage.map(e=>edgeLine(e,'up')).join('') : '<span class="muted">无上游</span>';
+  const downstream = d.downstream_lineage.length ? d.downstream_lineage.map(e=>edgeLine(e,'down')).join('') : '<span class="muted">无下游</span>';
+  const recalls = d.recall_events.map(e=>`<div class="recall">召回待审事件：来源批 #${e.source_id}（${h(e.trigger_type)}）｜原状态 <b>${STATE_NAME[e.prior_state]||e.prior_state}</b>${e.withdrawn_from_release?'｜<b>已撤回放行，原决定保留</b>':''}<br><span class="muted">${h(e.reason)} · ${h(e.created_at)} · ${h(e.created_by)}</span></div>`).join('') || '<span class="muted">无召回记录</span>';
+  const reviews = d.recall_reviews.map(r=>`<tr><td>${h(r.created_at)}</td><td>${h(r.reviewed_by)}</td><td>${h(r.action)}</td><td>${h(r.note)}</td></tr>`).join('');
+  const devs = d.deviations.map(x=>`<tr><td>${x.id}</td><td>${x.severity==='critical'?'<span class="tag crit">关键</span>':'一般'}</td><td>${h(x.title)}</td><td>${x.status==='open'?'未关闭':'已关闭'}</td><td>${h(x.exception_reason||'')}</td></tr>`).join('');
+  const tests = d.tests.map(x=>`<tr><td>${h(x.test_type)}</td><td>第${x.round}轮</td><td>${x.result}</td><td>${x.spec_min}~${x.spec_max}</td><td>${x.passed?'<span class="ok">合格</span>':'<b class="block" style="display:inline;padding:1px 6px">不合格</b>'}</td></tr>`).join('');
+  const decs = d.decisions.map(x=>`<tr><td>${h(x.created_at)}</td><td>${h(x.decision)}</td><td>rev${x.revision}</td><td>${h(x.rationale)}</td><td>${h(x.exception_code||'')}</td><td>${h(x.decided_by)}</td></tr>`).join('');
+
+  const recallForm = b.state==='recall_pending' ? `
+    <h3>召回审查（qa）</h3>
+    <div class="row">
+      <input id="rr-note-${b.id}" placeholder="审查意见（必填）" style="width:320px">
+      <button class="ghost" onclick="recallReview(${b.id},'note')">仅记录意见</button>
+      <button class="danger" onclick="recallReview(${b.id},'reject')">审查拒收</button>
+      <button onclick="recallReview(${b.id},'release')">上游已解除·维持/恢复放行</button>
+    </div>${d.active_blockers.length?'<p class="muted">当前仍有活动阻塞，放行类审查不会改变状态；请先关闭上游关键偏差或处理拒收批，再走放行决定流程。</p>':''}` : '';
+
+  return `<div class="detail">
+    <h3>上游链路（来源批 → 本批）</h3>${upstream}
+    <h3>下游链路（本批 → 包装/返工批）</h3>${downstream}
+    <h3>阻塞来源（实时沿血缘向上追溯）</h3>${blockers}
+    <h3>召回待审记录</h3>${recalls}
+    ${reviews?`<table><tr><th>时间</th><th>审查人</th><th>动作</th><th>意见</th></tr>${reviews}</table>`:''}
+    ${recallForm}
+    <h3>偏差</h3><table><tr><th>#</th><th>等级</th><th>标题</th><th>状态</th><th>例外</th></tr>${devs||'<tr><td colspan=5 class=muted>无</td></tr>'}</table>
+    <div class="row">
+      <select id="dv-sev-${b.id}"><option value="minor">一般</option><option value="critical">关键（将触发下游召回待审）</option></select>
+      <input id="dv-title-${b.id}" placeholder="偏差标题" style="width:240px">
+      <input id="dv-due-${b.id}" type="date">
+      <button class="ghost" onclick="addDeviation(${b.id})">新增偏差（operator/inspector）</button>
+    </div>
+    <p class="muted">当前修订号 ${b.revision}：关闭偏差请填纠正措施后调用 POST /api/deviations/{id}/close（rev ${b.revision}）。</p>
+    <h3>检验 / 复测</h3><table><tr><th>项目</th><th>轮次</th><th>结果</th><th>标准</th><th>判定</th></tr>${tests||'<tr><td colspan=5 class=muted>无</td></tr>'}</table>
+    <div class="row">
+      <input id="ts-type-${b.id}" placeholder="项目，如 含量" style="width:120px">
+      <input id="ts-res-${b.id}" type="number" placeholder="结果" style="width:90px">
+      <input id="ts-min-${b.id}" type="number" placeholder="下限" style="width:80px">
+      <input id="ts-max-${b.id}" type="number" placeholder="上限" style="width:80px">
+      <button class="ghost" onclick="addTest(${b.id})">记录检验（lab）</button>
+    </div>
+    <h3>质量决定（qa，需携带修订号 ${b.revision}）</h3>
+    <div class="row">
+      <select id="dc-dec-${b.id}"><option value="release">正式放行</option><option value="conditional">有条件放行</option><option value="resample">再取样</option><option value="reject">拒收（触发下游召回待审）</option></select>
+      <input id="dc-rat-${b.id}" placeholder="决定依据" style="width:300px">
+      <input id="dc-exc-${b.id}" placeholder="有条件放行例外编号" style="width:170px">
+      <button onclick="decide(${b.id})">提交决定</button>
+    </div>
+    <h3>历史决定（撤回后仍保留原放行决定）</h3><table><tr><th>时间</th><th>决定</th><th>版本</th><th>依据</th><th>例外号</th><th>决定人</th></tr>${decs||'<tr><td colspan=6 class=muted>无</td></tr>'}</table>
+  </div>`;
+}
+
+// ---------- 操作 ----------
+const fid = id => $(id).value;
+function addFactory(){ run(async()=>{ await api('/api/factories',{code:fid('f_code'),name:fid('f_name'),country:fid('f_country')}); toast('工厂已登记',1); }); }
+function addBatch(){ run(async()=>{ const b=await api('/api/batches',{factory_id:+fid('b_factory'),batch_no:fid('b_no'),product:fid('b_product'),mfg_date:fid('b_mfg'),expiry_date:fid('b_exp'),quantity:+fid('b_qty')||0}); toast('批次 '+b.batch_no+' 已登记',1); }); }
+function addLineage(){
+  run(async()=>{
+    const up=+fid('l_up'), down=+fid('l_down');
+    const e=await api('/api/lineage',{factory_id:+fid('l_factory'),upstream_id:up,downstream_id:down,quantity:+fid('l_qty'),upstream_revision:+fid('l_rev')});
+    toast(`血缘已登记：投入 ${e.quantity}`,1);
+  });
+}
+function addDeviation(id){
+  run(async()=>{
+    const b=batchById(id);
+    await api(`/api/batches/${id}/deviations`,{factory_id:b.factory_id,severity:$('dv-sev-'+id).value,title:$('dv-title-'+id).value,due_at:$('dv-due-'+id).value||null,expected_revision:b.revision});
+    toast('偏差已记录',1);
+  });
+}
+function addTest(id){
+  run(async()=>{
+    const b=batchById(id);
+    await api(`/api/batches/${id}/tests`,{factory_id:b.factory_id,test_type:$('ts-type-'+id).value,result:+$('ts-res-'+id).value,spec_min:+$('ts-min-'+id).value,spec_max:+$('ts-max-'+id).value,expected_revision:b.revision});
+    toast('检验已记录',1);
+  });
+}
+function decide(id){
+  run(async()=>{
+    const r=await api(`/api/batches/${id}/decide`,{decision:$('dc-dec-'+id).value,rationale:$('dc-rat-'+id).value,exception_code:$('dc-exc-'+id).value,expected_revision:batchById(id).revision});
+    toast('决定已提交：'+r.batch.state,1);
+  });
+}
+function recallReview(id,action){
+  run(async()=>{
+    const r=await api(`/api/batches/${id}/recall-review`,{action,note:$('rr-note-'+id).value});
+    toast(r.warning || ('召回审查已记录：'+r.batch.state), !r.warning);
+  });
+}
+// 上下游下拉与上游修订号联动
+function syncLineageSelects(){
+  const f=$('l_factory').value;
+  const opts = STATE.batches.filter(b=>String(b.factory_id)===f).map(b=>`<option value="${b.id}">${h(b.batch_no)}（${STATE_NAME[b.state]} 可用${h(b.available_quantity)} rev${b.revision}）</option>`).join('');
+  $('l_up').innerHTML=opts; $('l_down').innerHTML=opts;
+  const up=batchById(+$('l_up').value); if(up) $('l_rev').value=up.revision;
+}
+document.addEventListener('change', e=>{ if(e.target.id==='l_factory'||e.target.id==='l_up'){ if(STATE) syncLineageSelects(); }});
+const _load = loadState;
+loadState = async function(){ await _load(); syncLineageSelects(); };
+loadState();
+</script>
+</html>
