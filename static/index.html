@@ -1,1 +1,125 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>批次放行</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>药品生产偏差与批次放行</h1><p>偏差、检验、返工、供应商变更和稳定性数据共同约束质量放行。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>批次放行与血缘</title>
+<style>
+body{font:16px system-ui;max-width:1200px;margin:32px auto;padding:0 20px;color:#111827}
+section{margin:24px 0;padding:16px 20px;border:1px solid #e5e7eb;border-radius:8px}
+table{border-collapse:collapse;width:100%;margin:8px 0;font-size:14px}
+td,th{border:1px solid #e5e7eb;padding:6px 10px;text-align:left}
+th{background:#f9fafb}
+button{padding:6px 14px;cursor:pointer}
+input,select{padding:6px;margin:2px 4px 2px 0}
+.badge{padding:2px 10px;border-radius:10px;font-size:12px;color:#fff;white-space:nowrap}
+.st-manufactured{background:#6b7280}.st-investigation{background:#d97706}.st-awaiting_resample{background:#d97706}
+.st-conditional{background:#2563eb}.st-released{background:#16a34a}.st-rejected{background:#dc2626}.st-recall_review{background:#ea580c}
+.blocking{color:#dc2626;font-weight:600}
+.warn{background:#fef2f2;border:1px solid #fecaca;padding:10px 14px;border-radius:6px;margin:8px 0}
+ul.tree{list-style:none;border-left:2px solid #d1d5db;margin:6px 0 6px 4px;padding-left:18px}
+ul.tree li{margin:6px 0}
+a{color:#2563eb}
+pre{background:#f3f5f7;padding:12px;overflow:auto;font-size:13px}
+.err{color:#dc2626;margin-top:6px}
+.muted{color:#6b7280;font-size:13px}
+</style>
+<h1>药品生产偏差、放行与批次血缘</h1>
+<p class="muted">检验、偏差、返工与放行流程保持不变；血缘登记校验同厂、可用量与成环，上游拒收或关键偏差未关闭时下游自动进入召回待审。</p>
+
+<section><h2>批次</h2>
+<div>
+  <select id="f_factory"></select>
+  <input id="f_no" placeholder="批号">
+  <input id="f_product" placeholder="产品">
+  <input id="f_mfg" type="date" value="2026-01-01">
+  <input id="f_exp" type="date" value="2028-01-01">
+  <input id="f_qty" type="number" min="0" step="any" placeholder="批量" style="width:90px">
+  <button onclick="createBatch()">登记批次</button>
+  <button onclick="loadState()">刷新</button>
+  <div class="err" id="batch_err"></div>
+</div>
+<div id="batches"></div>
+</section>
+
+<section><h2>血缘登记</h2>
+<div>
+  下游批 <select id="l_down"></select>
+  投入来源（上游）批 <select id="l_up"></select>
+  投入数量 <input id="l_qty" type="number" min="0" step="any" style="width:100px">
+  <button onclick="createLink()">登记血缘</button>
+  <div class="err" id="link_err"></div>
+</div>
+<div id="links"></div>
+</section>
+
+<section><h2>批次详情与血缘链路</h2><div id="detail" class="muted">点击上方批次查看。</div></section>
+
+<section><h2>最近审计</h2><pre id="audits">加载中...</pre></section>
+
+<script>
+const H={"Content-Type":"application/json","X-Actor":"web-operator","X-Role":"operator"};
+const S={};
+async function api(path,opts){const r=await fetch(path,opts);const d=await r.json();if(!r.ok)throw new Error(d.error||r.status);return d}
+function badge(st){return `<span class="badge st-${st}">${st}</span>`}
+function opts(list){return list.map(b=>`<option value="${b.id}">${b.batch_no}（${b.product}，可用 ${b.available_quantity??b.quantity}）</option>`).join("")}
+
+async function loadState(){
+  const s=await api('/api/state');S.data=s;
+  f_factory.innerHTML=s.factories.map(f=>`<option value="${f.id}">${f.name}（${f.code}）</option>`).join("");
+  l_down.innerHTML=opts(s.batches);l_up.innerHTML=opts(s.batches);
+  batches.innerHTML="<table><tr><th>批号</th><th>产品</th><th>状态</th><th>批量</th><th>可用量</th><th>修订</th></tr>"+
+    s.batches.map(b=>`<tr><td><a href="#" onclick="showBatch(${b.id});return false">${b.batch_no}</a></td><td>${b.product}</td><td>${badge(b.state)}</td><td>${b.quantity}</td><td>${b.available_quantity}</td><td>${b.revision}</td></tr>`).join("")+"</table>";
+  links.innerHTML=s.links.length?"<table><tr><th>上游批</th><th>下游批</th><th>投入数量</th><th>登记人</th></tr>"+
+    s.links.map(l=>`<tr><td><a href="#" onclick="showBatch(${l.upstream_batch_id});return false">${l.upstream_batch_no}</a></td><td><a href="#" onclick="showBatch(${l.downstream_batch_id});return false">${l.downstream_batch_no}</a></td><td>${l.quantity}</td><td>${l.created_by}</td></tr>`).join("")+"</table>":"<p class='muted'>暂无血缘关系。</p>";
+  audits.textContent=JSON.stringify(s.audits,null,2);
+}
+
+async function createBatch(){
+  batch_err.textContent="";
+  try{
+    await api('/api/batches',{method:'POST',headers:H,body:JSON.stringify({factory_id:+f_factory.value,batch_no:f_no.value,product:f_product.value,mfg_date:f_mfg.value,expiry_date:f_exp.value,quantity:+f_qty.value||0})});
+    await loadState();
+  }catch(e){batch_err.textContent=e.message}
+}
+
+async function createLink(){
+  link_err.textContent="";
+  try{
+    const down=S.data.batches.find(b=>b.id==l_down.value);
+    await api(`/api/batches/${l_down.value}/links`,{method:'POST',headers:H,body:JSON.stringify({factory_id:down.factory_id,upstream_batch_id:+l_up.value,quantity:+l_qty.value})});
+    await loadState();
+  }catch(e){link_err.textContent=e.message}
+}
+
+async function tree(id,dir,visited){
+  if(visited.has(id))return "";
+  visited.add(id);
+  const d=await api(`/api/batches/${id}`);
+  const edges=d.links[dir];
+  if(!edges.length)return "";
+  let h="<ul class='tree'>";
+  for(const e of edges){
+    h+=`<li><a href="#" onclick="showBatch(${e.batch_id});return false">${e.batch_no}</a> ${badge(e.state)} 投入量 <b>${e.quantity}</b>`;
+    if(e.blocking)h+=` <span class="blocking">⚠ 阻塞来源：${e.block_reasons.join("；")}</span>`;
+    h+=await tree(e.batch_id,dir,visited)+"</li>";
+  }
+  return h+"</ul>";
+}
+
+async function showBatch(id){
+  const d=await api(`/api/batches/${id}`);const b=d.batch;
+  let h=`<h3>${b.batch_no}（${b.product}） ${badge(b.state)}</h3>
+  <p class="muted">批量 ${b.quantity} ｜ 生产 ${b.mfg_date} ｜ 有效期至 ${b.expiry_date} ｜ 修订 ${b.revision}</p>`;
+  if(d.links.recall_sources.length)
+    h+=`<div class="warn">召回待审阻塞来源：`+d.links.recall_sources.map(s=>`<b>${s.batch_no}</b>（${s.block_reasons.join("、")}）`).join("；")+`</div>`;
+  h+=`<h4>上游链路（投入来源）</h4>`;
+  h+=d.links.upstream.length?await tree(id,"upstream",new Set([id])):"<p class='muted'>无上游批次。</p>";
+  h+=`<h4>下游链路（投入去向）</h4>`;
+  h+=d.links.downstream.length?await tree(id,"downstream",new Set([id])):"<p class='muted'>无下游批次。</p>";
+  if(d.decisions.length)h+=`<h4>放行决定（含已撤回批次的历史决定）</h4><table><tr><th>修订</th><th>决定</th><th>依据</th><th>决定人</th><th>时间</th></tr>`+
+    d.decisions.map(x=>`<tr><td>${x.revision}</td><td>${x.decision}</td><td>${x.rationale}</td><td>${x.decided_by}</td><td>${x.created_at}</td></tr>`).join("")+"</table>";
+  if(d.deviations.length)h+=`<h4>偏差</h4><table><tr><th>等级</th><th>描述</th><th>状态</th><th>纠正措施</th></tr>`+
+    d.deviations.map(x=>`<tr><td>${x.severity}</td><td>${x.title}</td><td>${x.status}</td><td>${x.corrective_action||""}</td></tr>`).join("")+"</table>";
+  if(d.tests.length)h+=`<h4>检验</h4><table><tr><th>项目</th><th>结果</th><th>标准</th><th>轮次</th><th>结论</th></tr>`+
+    d.tests.map(x=>`<tr><td>${x.test_type}</td><td>${x.result}</td><td>${x.spec_min}~${x.spec_max}</td><td>${x.round}</td><td>${x.passed?"合格":"不合格"}</td></tr>`).join("")+"</table>";
+  detail.innerHTML=h;
+  detail.scrollIntoView({behavior:"smooth"});
+}
+loadState();
+</script>

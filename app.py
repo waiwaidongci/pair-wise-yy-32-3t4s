@@ -50,9 +50,18 @@ class Store:
         CREATE TABLE IF NOT EXISTS batches (
           id INTEGER PRIMARY KEY AUTOINCREMENT, factory_id INTEGER NOT NULL REFERENCES factories(id),
           batch_no TEXT NOT NULL, product TEXT NOT NULL, mfg_date TEXT NOT NULL, expiry_date TEXT NOT NULL,
-          state TEXT NOT NULL CHECK(state IN ('manufactured','investigation','awaiting_resample','conditional','released','rejected')),
+          quantity REAL NOT NULL DEFAULT 0,
+          state TEXT NOT NULL CHECK(state IN ('manufactured','investigation','awaiting_resample','conditional','released','rejected','recall_review')),
           revision INTEGER NOT NULL DEFAULT 1, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
           UNIQUE(factory_id,batch_no)
+        );
+        CREATE TABLE IF NOT EXISTS batch_links (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, factory_id INTEGER NOT NULL REFERENCES factories(id),
+          upstream_batch_id INTEGER NOT NULL REFERENCES batches(id),
+          downstream_batch_id INTEGER NOT NULL REFERENCES batches(id),
+          quantity REAL NOT NULL CHECK(quantity > 0),
+          created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          UNIQUE(upstream_batch_id,downstream_batch_id)
         );
         CREATE TABLE IF NOT EXISTS deviations (
           id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id INTEGER NOT NULL REFERENCES batches(id),
@@ -91,7 +100,40 @@ class Store:
           entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, details_json TEXT NOT NULL
         );
         """)
+        self._migrate_batches()
         self.conn.commit()
+
+    def _migrate_batches(self) -> None:
+        """Old databases lack the quantity column / recall_review state; rebuild the table in place."""
+        row = self.conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='batches'").fetchone()
+        if not row:
+            return
+        cols = [info[1] for info in self.conn.execute("PRAGMA table_info(batches)")]
+        if "quantity" not in cols:
+            self.conn.execute("ALTER TABLE batches ADD COLUMN quantity REAL NOT NULL DEFAULT 0")
+            self.conn.commit()
+        if "recall_review" in row[0]:
+            return
+        self.conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            self.conn.executescript("""
+            BEGIN;
+            ALTER TABLE batches RENAME TO batches_legacy;
+            CREATE TABLE batches (
+              id INTEGER PRIMARY KEY AUTOINCREMENT, factory_id INTEGER NOT NULL REFERENCES factories(id),
+              batch_no TEXT NOT NULL, product TEXT NOT NULL, mfg_date TEXT NOT NULL, expiry_date TEXT NOT NULL,
+              quantity REAL NOT NULL DEFAULT 0,
+              state TEXT NOT NULL CHECK(state IN ('manufactured','investigation','awaiting_resample','conditional','released','rejected','recall_review')),
+              revision INTEGER NOT NULL DEFAULT 1, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+              UNIQUE(factory_id,batch_no)
+            );
+            INSERT INTO batches(id,factory_id,batch_no,product,mfg_date,expiry_date,quantity,state,revision,created_by,created_at,updated_at)
+              SELECT id,factory_id,batch_no,product,mfg_date,expiry_date,quantity,state,revision,created_by,created_at,updated_at FROM batches_legacy;
+            DROP TABLE batches_legacy;
+            COMMIT;
+            """)
+        finally:
+            self.conn.execute("PRAGMA foreign_keys=ON")
 
     def audit(self, actor: str, action: str, entity_type: str, entity_id: object, details: dict) -> None:
         self.conn.execute("INSERT INTO audit_log(at,actor,action,entity_type,entity_id,details_json) VALUES(?,?,?,?,?,?)",
@@ -131,16 +173,17 @@ class BatchService:
         except sqlite3.IntegrityError as exc: raise ApiError(409, "工厂代号已存在") from exc
         return {"id": cur.lastrowid, "code": code, "name": name, "country": country}
 
-    def create_batch(self, actor: str | None, role: str | None, factory_id: int, batch_no: str, product: str, mfg_date: str, expiry_date: str) -> dict:
+    def create_batch(self, actor: str | None, role: str | None, factory_id: int, batch_no: str, product: str, mfg_date: str, expiry_date: str, quantity: float = 0.0) -> dict:
         actor = self._actor(actor, role, {"operator"})
         self._factory_check(actor, factory_id)
         if not batch_no.strip() or not product.strip() or expiry_date <= mfg_date: raise ApiError(400, "批号、产品或有效期不合法")
+        if quantity < 0: raise ApiError(400, "批量不能为负数")
         stamp = now()
         try:
             with self.conn:
-                cur = self.conn.execute("""INSERT INTO batches(factory_id,batch_no,product,mfg_date,expiry_date,state,created_by,created_at,updated_at)
-                                         VALUES(?,?,?,?,?, 'manufactured',?,?,?)""",
-                                        (factory_id, batch_no, product, mfg_date, expiry_date, actor, stamp, stamp))
+                cur = self.conn.execute("""INSERT INTO batches(factory_id,batch_no,product,mfg_date,expiry_date,quantity,state,created_by,created_at,updated_at)
+                                         VALUES(?,?,?,?,?,?, 'manufactured',?,?,?)""",
+                                        (factory_id, batch_no, product, mfg_date, expiry_date, quantity, actor, stamp, stamp))
                 self.store.audit(actor, "batch.create", "batch", cur.lastrowid, {"factory_id": factory_id, "batch_no": batch_no})
         except sqlite3.IntegrityError as exc: raise ApiError(409, "该工厂批号已存在") from exc
         return self._batch_dict(self._row("batches", cur.lastrowid))
@@ -154,6 +197,8 @@ class BatchService:
             cur = self.conn.execute("""INSERT INTO deviations(batch_id,severity,title,due_at,status,created_by,created_at)
                                      VALUES(?,?,?,?,'open',?,?)""", (batch_id, severity, title, due_at, actor, now()))
             self._advance_batch(batch_id, expected_revision, "investigation")
+            if severity == "critical":
+                self._apply_recall(batch_id, actor)
             self.store.audit(actor, "deviation.open", "deviation", cur.lastrowid, {"batch_id": batch_id, "severity": severity})
         return self._deviation_dict(self._row("deviations", cur.lastrowid))
 
@@ -274,6 +319,8 @@ class BatchService:
             updated = self.conn.execute("UPDATE batches SET state=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?",
                                         (new_state, now(), batch_id, expected_revision))
             if updated.rowcount != 1: raise ApiError(409, "并发放行冲突")
+            if new_state == "rejected":
+                self._apply_recall(batch_id, actor)
             self.store.audit(actor, "batch.decision", "batch", batch_id, {"decision": decision, "revision": batch["revision"], "state": new_state, "exception_code": exception_code})
         return {"decision": dict(self._row("decisions", cur.lastrowid)), "batch": self.batch_detail(batch_id)["batch"]}
 
@@ -285,16 +332,121 @@ class BatchService:
                                 (next_state, now(), batch_id, expected_revision))
         if cur.rowcount != 1: raise ApiError(409, "并发更新冲突")
 
+    def add_link(self, actor: str | None, role: str | None, factory_id: int, downstream_batch_id: int, upstream_batch_id: int, quantity: float) -> dict:
+        """登记批次血缘：upstream 投入 quantity 到 downstream。跨厂、超量、成环均拒绝且不落库。"""
+        actor = self._actor(actor, role, {"operator"})
+        downstream = self._row("batches", downstream_batch_id)
+        upstream = self._row("batches", upstream_batch_id)
+        self._factory_check(actor, factory_id, downstream)
+        if int(upstream["factory_id"]) != int(downstream["factory_id"]):
+            raise ApiError(409, "跨厂批次不能建立血缘关系")
+        if int(upstream_batch_id) == int(downstream_batch_id):
+            raise ApiError(409, "批次不能与自身建立血缘")
+        try:
+            qty = float(quantity)
+        except (TypeError, ValueError) as exc: raise ApiError(400, "投入数量不合法") from exc
+        if qty <= 0: raise ApiError(400, "投入数量必须为正数")
+        used = self.conn.execute("SELECT COALESCE(SUM(quantity),0) FROM batch_links WHERE upstream_batch_id=?",
+                                 (upstream_batch_id,)).fetchone()[0]
+        available = float(upstream["quantity"]) - float(used)
+        if qty > available + 1e-9:
+            raise ApiError(409, f"投入数量 {qty:g} 超出来源批可用量 {available:g}")
+        if int(upstream_batch_id) in self._descendants(downstream_batch_id):
+            raise ApiError(409, "血缘关系成环，已拒绝登记")
+        try:
+            with self.conn:
+                cur = self.conn.execute("""INSERT INTO batch_links(factory_id,upstream_batch_id,downstream_batch_id,quantity,created_by,created_at)
+                                         VALUES(?,?,?,?,?,?)""",
+                                        (factory_id, upstream_batch_id, downstream_batch_id, qty, actor, now()))
+                self.store.audit(actor, "lineage.link", "batch_link", cur.lastrowid,
+                                 {"upstream_batch_id": upstream_batch_id, "downstream_batch_id": downstream_batch_id, "quantity": qty})
+                if self._blocking_reasons(upstream_batch_id):
+                    self._apply_recall(upstream_batch_id, actor)
+        except sqlite3.IntegrityError as exc: raise ApiError(409, "该上下游关系已存在") from exc
+        return self._link_dict(self._row("batch_links", cur.lastrowid))
+
+    def _descendants(self, batch_id: int) -> list[int]:
+        """沿血缘向下（upstream -> downstream）遍历所有下游批次。"""
+        seen, stack, order = {batch_id}, [batch_id], []
+        while stack:
+            current = stack.pop()
+            for row in self.conn.execute("SELECT downstream_batch_id FROM batch_links WHERE upstream_batch_id=?", (current,)):
+                nxt = int(row["downstream_batch_id"])
+                if nxt not in seen:
+                    seen.add(nxt); order.append(nxt); stack.append(nxt)
+        return order
+
+    def _ancestors(self, batch_id: int) -> list[int]:
+        """沿血缘向上遍历所有来源批次。"""
+        seen, stack, order = {batch_id}, [batch_id], []
+        while stack:
+            current = stack.pop()
+            for row in self.conn.execute("SELECT upstream_batch_id FROM batch_links WHERE downstream_batch_id=?", (current,)):
+                nxt = int(row["upstream_batch_id"])
+                if nxt not in seen:
+                    seen.add(nxt); order.append(nxt); stack.append(nxt)
+        return order
+
+    def _blocking_reasons(self, batch_id: int) -> list[str]:
+        batch = self._row("batches", batch_id)
+        reasons: list[str] = []
+        if batch["state"] == "rejected":
+            reasons.append("上游批次已拒收")
+        open_critical = self.conn.execute(
+            "SELECT COUNT(*) FROM deviations WHERE batch_id=? AND severity='critical' AND status='open'", (batch_id,)).fetchone()[0]
+        if open_critical:
+            reasons.append("上游批次存在未关闭关键偏差")
+        return reasons
+
+    def _apply_recall(self, source_batch_id: int, actor: str) -> None:
+        """所有下游批次进入召回待审；已放行批次撤回，原放行决定保留在 decisions 中。"""
+        for descendant_id in self._descendants(source_batch_id):
+            batch = self._row("batches", descendant_id)
+            if batch["state"] in {"rejected", "recall_review"}:
+                continue
+            self.conn.execute("UPDATE batches SET state='recall_review',revision=revision+1,updated_at=? WHERE id=?",
+                              (now(), descendant_id))
+            self.store.audit(actor, "batch.recall_review", "batch", descendant_id,
+                             {"source_batch_id": source_batch_id, "previous_state": batch["state"]})
+
+    def lineage(self, batch_id: int) -> dict:
+        def entry(link: sqlite3.Row, other_id: int) -> dict:
+            other = self._row("batches", other_id)
+            reasons = self._blocking_reasons(other_id)
+            return {"link_id": link["id"], "batch_id": other_id, "batch_no": other["batch_no"], "product": other["product"],
+                    "state": other["state"], "quantity": link["quantity"], "blocking": bool(reasons), "block_reasons": reasons}
+        upstream = [entry(row, int(row["upstream_batch_id"]))
+                    for row in self.conn.execute("SELECT * FROM batch_links WHERE downstream_batch_id=? ORDER BY id", (batch_id,))]
+        downstream = [entry(row, int(row["downstream_batch_id"]))
+                      for row in self.conn.execute("SELECT * FROM batch_links WHERE upstream_batch_id=? ORDER BY id", (batch_id,))]
+        recall_sources = []
+        for ancestor_id in self._ancestors(batch_id):
+            reasons = self._blocking_reasons(ancestor_id)
+            if reasons:
+                source = self._row("batches", ancestor_id)
+                recall_sources.append({"batch_id": ancestor_id, "batch_no": source["batch_no"],
+                                       "state": source["state"], "block_reasons": reasons})
+        return {"upstream": upstream, "downstream": downstream, "recall_sources": recall_sources}
+
+    def _link_dict(self, row: sqlite3.Row) -> dict:
+        upstream = self._row("batches", row["upstream_batch_id"])
+        downstream = self._row("batches", row["downstream_batch_id"])
+        return {"id": row["id"], "factory_id": row["factory_id"],
+                "upstream_batch_id": row["upstream_batch_id"], "upstream_batch_no": upstream["batch_no"],
+                "downstream_batch_id": row["downstream_batch_id"], "downstream_batch_no": downstream["batch_no"],
+                "quantity": row["quantity"], "created_by": row["created_by"], "created_at": row["created_at"]}
+
     def batch_detail(self, batch_id: int) -> dict:
         batch = self._batch_dict(self._row("batches", batch_id))
         def rows(name: str) -> list[dict]: return [dict(row) for row in self.conn.execute(f"SELECT * FROM {name} WHERE batch_id=? ORDER BY id", (batch_id,))]
         return {"batch": batch, "deviations": rows("deviations"), "tests": rows("tests"), "rework": rows("rework"),
                 "supplier_changes": rows("supplier_changes"), "stability": rows("stability"),
-                "decisions": rows("decisions")}
+                "decisions": rows("decisions"), "links": self.lineage(batch_id)}
 
     def _batch_dict(self, row: sqlite3.Row) -> dict:
         return {"id": row["id"], "factory_id": row["factory_id"], "batch_no": row["batch_no"], "product": row["product"],
-                "mfg_date": row["mfg_date"], "expiry_date": row["expiry_date"], "state": row["state"], "revision": row["revision"]}
+                "mfg_date": row["mfg_date"], "expiry_date": row["expiry_date"], "quantity": row["quantity"],
+                "state": row["state"], "revision": row["revision"]}
 
     @staticmethod
     def _deviation_dict(row: sqlite3.Row) -> dict:
@@ -308,8 +460,16 @@ class BatchService:
                 "spec_min": row["spec_min"], "spec_max": row["spec_max"], "passed": bool(row["passed"]), "round": row["round"]}
 
     def state(self) -> dict:
+        batches = []
+        for row in self.conn.execute("SELECT * FROM batches ORDER BY id DESC"):
+            item = self._batch_dict(row)
+            used = self.conn.execute("SELECT COALESCE(SUM(quantity),0) FROM batch_links WHERE upstream_batch_id=?",
+                                     (row["id"],)).fetchone()[0]
+            item["available_quantity"] = float(row["quantity"]) - float(used)
+            batches.append(item)
         return {"factories": [dict(row) for row in self.conn.execute("SELECT * FROM factories ORDER BY id")],
-                "batches": [self._batch_dict(row) for row in self.conn.execute("SELECT * FROM batches ORDER BY id DESC")],
+                "batches": batches,
+                "links": [self._link_dict(row) for row in self.conn.execute("SELECT * FROM batch_links ORDER BY id")],
                 "audits": [dict(row) for row in self.conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 30")]}
 
     def seed(self) -> None:
@@ -346,7 +506,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             p, b = self._parts(), self._body(); actor, role = self.headers.get("X-Actor"), self.headers.get("X-Role")
             if p == ["api", "factories"]: out = self.service.register_factory(actor, role, b.get("code", ""), b.get("name", ""), b.get("country", ""))
-            elif p == ["api", "batches"]: out = self.service.create_batch(actor, role, int(b.get("factory_id", 0)), b.get("batch_no", ""), b.get("product", ""), b.get("mfg_date", ""), b.get("expiry_date", ""))
+            elif p == ["api", "batches"]: out = self.service.create_batch(actor, role, int(b.get("factory_id", 0)), b.get("batch_no", ""), b.get("product", ""), b.get("mfg_date", ""), b.get("expiry_date", ""), float(b.get("quantity", 0) or 0))
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "deviations": out = self.service.add_deviation(actor, role, int(b.get("factory_id", 0)), int(p[2]), b.get("severity", ""), b.get("title", ""), b.get("due_at"), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "deviations"] and p[3] == "close": out = self.service.close_deviation(actor, role, int(p[2]), b.get("corrective_action", ""), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "deviations"] and p[3] == "exception": out = self.service.approve_exception(actor, role, int(p[2]), b.get("reason", ""), b.get("until", ""), int(b.get("expected_revision", -1)))
@@ -355,6 +515,7 @@ class Handler(BaseHTTPRequestHandler):
             elif len(p) == 4 and p[:2] == ["api", "rework"] and p[3] == "complete": out = self.service.complete_rework(actor, role, int(b.get("factory_id", 0)), int(p[2]), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "supplier-changes": out = self.service.record_supplier_change(actor, role, int(b.get("factory_id", 0)), int(p[2]), b.get("supplier", ""), b.get("change_type", ""), b.get("description", ""), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "stability": out = self.service.record_stability(actor, role, int(b.get("factory_id", 0)), int(p[2]), b.get("condition", ""), b.get("timepoint", ""), float(b.get("result", 0)), float(b.get("spec_limit", 0)), int(b.get("expected_revision", -1)))
+            elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "links": out = self.service.add_link(actor, role, int(b.get("factory_id", 0)), int(p[2]), int(b.get("upstream_batch_id", 0)), b.get("quantity", 0))
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "decide": out = self.service.decide(actor, role, int(p[2]), b.get("decision", ""), b.get("rationale", ""), int(b.get("expected_revision", -1)), b.get("exception_code", ""))
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
